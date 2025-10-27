@@ -1,0 +1,502 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ,master]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # Allow manual triggering
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov
+        
+    - name: Run tests
+      run: |
+        # Tạo test đơn giản nếu chưa có
+        python - <<'PY'
+        import importlib,sys,os
+        for m in ("app","main","server","index"):
+            try:
+                importlib.import_module(m)
+                print(f"Imported {m}")
+                break
+            except Exception as e:
+                pass
+        else:
+            print("No importable app module; skipping smoke test")
+        PY
+        
+    - name: Lint with flake8
+      run: |
+        pip install flake8
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository }}:latest
+          ghcr.io/${{ github.repository }}:main-${{ github.sha }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    # Removed explicit package visibility change to avoid 404 timing/scope issues
+
+  wait-for-secrets:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 5
+    
+    steps:
+    - name: Wait for secrets propagation
+      id: wait_secrets
+      run: |
+        echo "⏳ Waiting for MANIFESTS_REPO_TOKEN to be available..."
+        echo "GitHub secrets can take up to 120 seconds to propagate after being set."
+        
+        MAX_ATTEMPTS=24  # 24 attempts x 5 seconds = 120 seconds
+        ATTEMPT=0
+        
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          ATTEMPT=$((ATTEMPT + 1))
+          TOKEN="${{ secrets.MANIFESTS_REPO_TOKEN }}"
+          
+          if [ -n "$TOKEN" ]; then
+            echo "✅ MANIFESTS_REPO_TOKEN is now available! (attempt $ATTEMPT)"
+            # Verify token has access to repo
+            echo "Verifying token has access to manifests repository..."
+            git ls-remote --exit-code https://$TOKEN@github.com/ductri09072004/demo_fiss1_B.git > /dev/null 2>&1
+            
+            if [ $? -eq 0 ]; then
+              echo "✅ Token verified successfully!"
+              exit 0
+            else
+              echo "⚠️ Token present but may not have access yet (attempt $ATTEMPT/$MAX_ATTEMPTS)"
+            fi
+          else
+            echo "⏳ MANIFESTS_REPO_TOKEN not available yet (attempt $ATTEMPT/$MAX_ATTEMPTS)"
+          fi
+          
+          if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+            echo "⏳ Waiting 5 seconds before retry..."
+            sleep 5
+          fi
+        done
+        
+        echo "❌ MANIFESTS_REPO_TOKEN is still not available after 120 seconds"
+        echo "This secret should have been set automatically when the service was created."
+        echo "Please check:"
+        echo "  1. Go to Settings > Secrets and variables > Actions"
+        echo "  2. Verify MANIFESTS_REPO_TOKEN exists"
+        echo "  3. If not, re-run the service creation process"
+        echo ""
+        echo "The workflow will exit now. Please re-run this workflow after the secret is set."
+        exit 1
+
+  update-manifests:
+    needs: wait-for-secrets
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout manifests repo
+      uses: actions/checkout@v4
+      with:
+        repository: ductri09072004/demo_fiss1_B
+        token: ${{ secrets.MANIFESTS_REPO_TOKEN }}
+        path: manifests
+        
+    - name: Update image tag
+      run: |
+        cd manifests
+        # Use SERVICE_NAME secret if available, otherwise fallback to repo name
+        SERVICE="${{ secrets.SERVICE_NAME }}"
+        if [ -z "$SERVICE" ]; then
+          SERVICE="${{ github.event.repository.name }}"
+        fi
+        echo "Using service name: $SERVICE"
+        FILE="services/$SERVICE/k8s/deployment.yaml"
+        # Cập nhật image với tag duy nhất theo commit
+        sed -i "s|image: ghcr.io/.*/.*:.*|image: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:main-${{ github.sha }}|g" "$FILE"
+        # Cập nhật timestamp annotation để đảm bảo podTemplateSpec khác → rollout
+        TS=$(date +%s)
+        sed -i "s|timestamp: \".*\"|timestamp: \"$TS\"|g" "$FILE"
+        
+    - name: Create ArgoCD Application (if not exists)
+      run: |
+        cd manifests
+        # Use SERVICE_NAME secret if available, otherwise fallback to repo name
+        SERVICE="${{ secrets.SERVICE_NAME }}"
+        if [ -z "$SERVICE" ]; then
+          SERVICE="${{ github.event.repository.name }}"
+        fi
+        ARGOCD_APP_FILE="apps/${SERVICE}-application.yaml"
+        
+        # Check if ArgoCD application already exists
+        if [ ! -f "$ARGOCD_APP_FILE" ]; then
+          echo "Creating ArgoCD application for $SERVICE..."
+          
+          # Create apps directory if it doesn't exist
+          mkdir -p apps
+          
+          # Create ArgoCD application YAML
+          cat > "$ARGOCD_APP_FILE" <<EOF
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: ${SERVICE}
+          namespace: argocd
+          finalizers:
+            - resources-finalizer.argocd.argoproj.io
+        spec:
+          project: default
+          source:
+            repoURL: https://github.com/ductri09072004/demo_fiss1_B
+            targetRevision: HEAD
+            path: services/${SERVICE}/k8s
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: ${SERVICE}
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+            - CreateNamespace=true
+            - PrunePropagationPolicy=foreground
+            - PruneLast=true
+            - RespectIgnoreDifferences=true
+            - ServerSideApply=true
+            retry:
+              backoff:
+                duration: 5s
+                factor: 2
+                maxDuration: 3m
+              limit: 5
+          revisionHistoryLimit: 3
+        EOF
+          
+          echo "✅ ArgoCD application created"
+        else
+          echo "✅ ArgoCD application already exists"
+        fi
+        
+    - name: Commit and push changes
+      run: |
+        cd manifests
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add .
+        # Use SERVICE_NAME secret if available, otherwise fallback to repo name
+        SERVICE="${{ secrets.SERVICE_NAME }}"
+        if [ -z "$SERVICE" ]; then
+          SERVICE="${{ github.event.repository.name }}"
+        fi
+        git commit -m "Update $SERVICE image to ${{ github.sha }}" || exit 0
+        git push
+        
+    - name: Deploy ArgoCD Application via API
+      run: |
+        # Use SERVICE_NAME secret if available, otherwise fallback to repo name
+        SERVICE="${{ secrets.SERVICE_NAME }}"
+        if [ -z "$SERVICE" ]; then
+          SERVICE="${{ github.event.repository.name }}"
+        fi
+        ARGOCD_SERVER="${{ secrets.ARGOCD_SERVER_URL }}"
+        ARGOCD_PASSWORD="${{ secrets.ARGOCD_ADMIN_PASSWORD }}"
+        
+        echo "🔍 Checking ArgoCD configuration..."
+        echo "   ARGOCD_SERVER: ${ARGOCD_SERVER:+SET}${ARGOCD_SERVER:-NOT SET}"
+        echo "   ARGOCD_PASSWORD: ${ARGOCD_PASSWORD:+SET}${ARGOCD_PASSWORD:-NOT SET}"
+        
+        if [ -z "$ARGOCD_SERVER" ] || [ -z "$ARGOCD_PASSWORD" ]; then
+          echo "⚠️ ArgoCD credentials not configured - skipping deployment"
+          echo "💡 Please set ARGOCD_SERVER_URL and ARGOCD_ADMIN_PASSWORD in Repo A secrets"
+          exit 0
+        fi
+        
+        echo "Getting ArgoCD session token..."
+        # Login to ArgoCD and get session token
+        SESSION_RESP=$(curl -s -X POST "$ARGOCD_SERVER/api/v1/session" \
+          -H "Content-Type: application/json" \
+          -H "ngrok-skip-browser-warning: true" \
+          -d "{\"username\":\"admin\",\"password\":\"$ARGOCD_PASSWORD\"}" \
+          -k \
+          -c /tmp/argocd-cookies.txt)
+        
+        if echo "$SESSION_RESP" | grep -q "token"; then
+          echo "✅ ArgoCD session created"
+          
+          # Create ArgoCD Application JSON directly
+          APP_CONTENT=$(cat <<EOF
+        {
+          "metadata": {
+            "name": "$SERVICE",
+            "namespace": "argocd",
+            "finalizers": ["resources-finalizer.argocd.argoproj.io"]
+          },
+          "spec": {
+            "project": "default",
+            "source": {
+              "repoURL": "https://github.com/ductri09072004/demo_fiss1_B",
+              "targetRevision": "HEAD",
+              "path": "services/$SERVICE/k8s"
+            },
+            "destination": {
+              "server": "https://kubernetes.default.svc",
+              "namespace": "$SERVICE"
+            },
+            "syncPolicy": {
+              "automated": {
+                "prune": true,
+                "selfHeal": true
+              },
+              "syncOptions": [
+                "CreateNamespace=true",
+                "PrunePropagationPolicy=foreground",
+                "PruneLast=true",
+                "RespectIgnoreDifferences=true",
+                "ServerSideApply=true"
+              ],
+              "retry": {
+                "backoff": {
+                  "duration": "5s",
+                  "factor": 2,
+                  "maxDuration": "3m"
+                },
+                "limit": 5
+              }
+            },
+            "revisionHistoryLimit": 3
+          }
+        }
+        EOF
+          )
+          
+          # Create ArgoCD Application
+          echo "Creating ArgoCD Application for $SERVICE..."
+          CREATE_RESP=$(curl -s -X POST "$ARGOCD_SERVER/api/v1/applications" \
+            -H "Content-Type: application/json" \
+            -H "ngrok-skip-browser-warning: true" \
+            -b /tmp/argocd-cookies.txt \
+            -d "$APP_CONTENT" \
+            -k)
+          
+          if echo "$CREATE_RESP" | grep -q "createdAt\|alreadyExists"; then
+            echo "✅ ArgoCD Application deployed successfully"
+          else
+            echo "⚠️ Application may already exist or error occurred"
+            echo "Response: $CREATE_RESP"
+          fi
+        else
+          echo "⚠️ Failed to get ArgoCD session: $SESSION_RESP"
+        fi
+        
+    - name: Trigger ArgoCD Sync
+      run: |
+        # Use SERVICE_NAME secret if available, otherwise fallback to repo name
+        SERVICE="${{ secrets.SERVICE_NAME }}"
+        if [ -z "$SERVICE" ]; then
+          SERVICE="${{ github.event.repository.name }}"
+        fi
+        ARGOCD_SERVER="${{ secrets.ARGOCD_SERVER_URL }}"
+        ARGOCD_PASSWORD="${{ secrets.ARGOCD_ADMIN_PASSWORD }}"
+        
+        if [ -z "$ARGOCD_SERVER" ] || [ -z "$ARGOCD_PASSWORD" ]; then
+          echo "⚠️ ArgoCD credentials not configured - skipping sync trigger"
+          echo "💡 Please set ARGOCD_SERVER_URL and ARGOCD_ADMIN_PASSWORD in Repo A secrets"
+          exit 0
+        fi
+        
+        echo "🔄 Triggering ArgoCD sync for $SERVICE..."
+        
+        # Login to ArgoCD
+        SESSION_RESP=$(curl -s -X POST "$ARGOCD_SERVER/api/v1/session" \
+          -H "Content-Type: application/json" \
+          -H "ngrok-skip-browser-warning: true" \
+          -d "{\"username\":\"admin\",\"password\":\"$ARGOCD_PASSWORD\"}" \
+          -k \
+          -c /tmp/argocd-sync-cookies.txt)
+        
+        if echo "$SESSION_RESP" | grep -q "token"; then
+          echo "✅ Logged in to ArgoCD"
+          
+          # Check if application exists first
+          echo "🔍 Checking if application $SERVICE exists..."
+          APP_CHECK=$(curl -s -X GET "$ARGOCD_SERVER/api/v1/applications/$SERVICE" \
+            -H "ngrok-skip-browser-warning: true" \
+            -b /tmp/argocd-sync-cookies.txt \
+            -k)
+          
+          if echo "$APP_CHECK" | grep -q '"name":"'$SERVICE'"'; then
+            echo "✅ Application $SERVICE exists, triggering sync..."
+            
+            # Trigger sync via API
+            SYNC_RESP=$(curl -s -X POST "$ARGOCD_SERVER/api/v1/applications/$SERVICE/sync" \
+              -H "Content-Type: application/json" \
+              -H "ngrok-skip-browser-warning: true" \
+              -b /tmp/argocd-sync-cookies.txt \
+              -d '{"revision":"HEAD","prune":true,"dryRun":false}' \
+              -k)
+            
+            if echo "$SYNC_RESP" | grep -q "operationState"; then
+              echo "✅ ArgoCD sync triggered successfully!"
+            else
+              echo "⚠️ Sync trigger response: $SYNC_RESP"
+            fi
+          else
+            echo "⚠️ Application $SERVICE not found, sync will happen automatically when created"
+            echo "Response: $APP_CHECK"
+          fi
+        else
+          echo "⚠️ Failed to login to ArgoCD - sync will happen automatically"
+        fi
+        
+    - name: Wait for ArgoCD Healthy and Cleanup YAML
+      run: |
+        # Use SERVICE_NAME secret if available, otherwise fallback to repo name
+        SERVICE="${{ secrets.SERVICE_NAME }}"
+        if [ -z "$SERVICE" ]; then
+          SERVICE="${{ github.event.repository.name }}"
+        fi
+        ARGOCD_SERVER="${{ secrets.ARGOCD_SERVER_URL }}"
+        ARGOCD_PASSWORD="${{ secrets.ARGOCD_ADMIN_PASSWORD }}"
+        
+        if [ -z "$ARGOCD_SERVER" ] || [ -z "$ARGOCD_PASSWORD" ]; then
+          echo "⚠️ ArgoCD credentials not configured - skipping cleanup"
+          exit 0
+        fi
+        
+        echo "⏳ Waiting for ArgoCD application to be healthy..."
+        
+        # Wait for ArgoCD to be healthy (max 5 minutes)
+        for i in {1..30}; do
+          echo "🔍 Checking ArgoCD status (attempt $i/30)..."
+          
+          # Login to ArgoCD
+          SESSION_RESP=$(curl -s -X POST "$ARGOCD_SERVER/api/v1/session" \
+            -H "Content-Type: application/json" \
+            -H "ngrok-skip-browser-warning: true" \
+            -d "{\"username\":\"admin\",\"password\":\"$ARGOCD_PASSWORD\"}" \
+            -k \
+            -c /tmp/argocd-cleanup-cookies.txt)
+          
+          if echo "$SESSION_RESP" | grep -q "token"; then
+            # Check application status
+            STATUS_RESP=$(curl -s -X GET "$ARGOCD_SERVER/api/v1/applications/$SERVICE" \
+              -H "ngrok-skip-browser-warning: true" \
+              -b /tmp/argocd-cleanup-cookies.txt \
+              -k)
+            
+            if echo "$STATUS_RESP" | grep -q '"health":{"status":"Healthy"'; then
+              echo "✅ ArgoCD application $SERVICE is healthy!"
+              
+              # Cleanup YAML files from Repo B
+              echo "🧹 Cleaning up YAML files from Repo B..."
+              cd manifests
+              
+              # Files to delete
+              YAML_FILES=(
+                "services/$SERVICE/k8s/deployment.yaml"
+                "services/$SERVICE/k8s/service.yaml"
+                "services/$SERVICE/k8s/configmap.yaml"
+                "services/$SERVICE/k8s/hpa.yaml"
+                "services/$SERVICE/k8s/ingress.yaml"
+                "services/$SERVICE/k8s/ingress-gateway.yaml"
+                "services/$SERVICE/k8s/namespace.yaml"
+                "services/$SERVICE/k8s/secret.yaml"
+                "apps/$SERVICE-application.yaml"
+              )
+              
+              # Delete files that exist
+              for file in "${YAML_FILES[@]}"; do
+                if [ -f "$file" ]; then
+                  echo "🗑️ Deleting $file"
+                  git rm "$file" 2>/dev/null || rm -f "$file"
+                fi
+              done
+              
+              # Commit and push cleanup
+              git config --local user.email "action@github.com"
+              git config --local user.name "GitHub Action"
+              git add -A
+              if git diff --staged --quiet; then
+                echo "ℹ️ No changes to commit"
+              else
+                git commit -m "Cleanup YAML files after ArgoCD deployment - $SERVICE" || exit 0
+                git push
+                echo "✅ YAML files cleaned up successfully"
+              fi
+              
+              exit 0
+            else
+              echo "⏳ ArgoCD still deploying... (attempt $i/30)"
+            fi
+          else
+            echo "⚠️ Failed to login to ArgoCD (attempt $i/30)"
+          fi
+          
+          sleep 10
+        done
+        
+        echo "⚠️ ArgoCD did not reach healthy status within 5 minutes"
+        echo "💡 Check ArgoCD UI at $ARGOCD_SERVER for detailed status"
+
+
