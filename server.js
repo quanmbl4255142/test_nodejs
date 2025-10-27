@@ -25,7 +25,7 @@ app.get('/api/users', (req, res) => {
 
 app.get('/api/health', (req, res) => {
   res.json({
-    status: 'healthy v1.0',
+    status: 'healthy v2.0',
     service: 'Node.js Backend',
     timestamp: new Date().toISOString()
   });
